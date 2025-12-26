@@ -1,290 +1,120 @@
-from collections import defaultdict
-from pathlib import Path
-import sqlite3
-
-import streamlit as st
-import altair as alt
+import os
 import pandas as pd
+import streamlit as st
+from supabase import create_client
 
+# NOTE: Do NOT commit secrets into source control. Use `.streamlit/secrets.toml` or environment variables.
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title="Inventory tracker",
-    page_icon=":shopping_bags:",  # This is an emoji shortcode. Could be a URL too.
-)
+# 1. Page config
+st.set_page_config(page_title="ICP Project Dashboard", page_icon="🏊", layout="wide")
 
+# 2. Credentials via Streamlit secrets or environment variables
+SUPABASE_URL = (st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_URL")
+SUPABASE_KEY = (st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_KEY")
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Supabase credentials not found. Add them to Streamlit secrets or environment variables.")
+    st.stop()
 
+# 3. Cached supabase client
+@st.cache_resource
+def get_supabase(url: str, key: str):
+    return create_client(url, key)
 
-def connect_db():
-    """Connects to the sqlite database."""
+supabase = get_supabase(SUPABASE_URL, SUPABASE_KEY)
 
-    DB_FILENAME = Path(__file__).parent / "inventory.db"
-    db_already_exists = DB_FILENAME.exists()
+# 4. Sidebar branding & controls
+with st.sidebar:
+    st.title("🏗️ ICP Admin")
+    st.markdown("---")
+    st.info("Managing project data for **Innovative Custom Pools**")
+    st.write("**Current Project:** P-0001 (Connie Morgan)")
+    st.markdown("---")
+    st.header("Filters")
+    min_price = st.number_input("Min unit price", value=0.0, step=1.0, format="%.2f")
+    max_price = st.number_input("Max unit price (0 = unlimited)", value=0.0, step=1.0, format="%.2f")
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.experimental_rerun()
 
-    conn = sqlite3.connect(DB_FILENAME)
-    db_was_just_created = not db_already_exists
+# 5. Fetch & cache data
+@st.cache_data(ttl=300)
+def fetch_lineitems():
+    resp = supabase.table("lineitems").select("*").execute()
+    # Handle response shapes from different client versions
+    data = None
+    if hasattr(resp, "data"):
+        data = resp.data
+    elif isinstance(resp, dict):
+        data = resp.get("data")
+    elif isinstance(resp, list) and resp and isinstance(resp[0], dict):
+        data = resp
+    else:
+        data = []
 
-    return conn, db_was_just_created
+    if getattr(resp, "error", None):
+        raise RuntimeError(getattr(resp.error, "message", str(resp.error)))
 
+    return data or []
 
-def initialize_data(conn):
-    """Initializes the inventory table with some data."""
-    cursor = conn.cursor()
+# 6. Main UI
+st.title("🏊 Innovative Custom Pools Dashboard")
+st.markdown("---")
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT,
-            price REAL,
-            units_sold INTEGER,
-            units_left INTEGER,
-            cost_price REAL,
-            reorder_point INTEGER,
-            description TEXT
-        )
-        """
-    )
+try:
+    with st.spinner("Loading data..."):
+        data = fetch_lineitems()
 
-    cursor.execute(
-        """
-        INSERT INTO inventory
-            (item_name, price, units_sold, units_left, cost_price, reorder_point, description)
-        VALUES
-            -- Beverages
-            ('Bottled Water (500ml)', 1.50, 115, 15, 0.80, 16, 'Hydrating bottled water'),
-            ('Soda (355ml)', 2.00, 93, 8, 1.20, 10, 'Carbonated soft drink'),
-            ('Energy Drink (250ml)', 2.50, 12, 18, 1.50, 8, 'High-caffeine energy drink'),
-            ('Coffee (hot, large)', 2.75, 11, 14, 1.80, 5, 'Freshly brewed hot coffee'),
-            ('Juice (200ml)', 2.25, 11, 9, 1.30, 5, 'Fruit juice blend'),
+    df = pd.DataFrame(data)
+    if df.empty:
+        st.warning("No line items found in the database. Please re-run the PDF importer.")
+        st.stop()
 
-            -- Snacks
-            ('Potato Chips (small)', 2.00, 34, 16, 1.00, 10, 'Salted and crispy potato chips'),
-            ('Candy Bar', 1.50, 6, 19, 0.80, 15, 'Chocolate and candy bar'),
-            ('Granola Bar', 2.25, 3, 12, 1.30, 8, 'Healthy and nutritious granola bar'),
-            ('Cookies (pack of 6)', 2.50, 8, 8, 1.50, 5, 'Soft and chewy cookies'),
-            ('Fruit Snack Pack', 1.75, 5, 10, 1.00, 8, 'Assortment of dried fruits and nuts'),
+    # Normalize columns and types
+    df['itemdescription'] = df.get('itemdescription', "").fillna("").astype(str)
+    df['unitprice'] = pd.to_numeric(df.get('unitprice', 0), errors='coerce').fillna(0.0)
+    df['quantity'] = pd.to_numeric(df.get('quantity', 1), errors='coerce').fillna(1)
+    df['total'] = df['unitprice'] * df['quantity']
+    df['material'] = df.get('material', "").fillna("").astype(str)
 
-            -- Personal Care
-            ('Toothpaste', 3.50, 1, 9, 2.00, 5, 'Minty toothpaste for oral hygiene'),
-            ('Hand Sanitizer (small)', 2.00, 2, 13, 1.20, 8, 'Small sanitizer bottle for on-the-go'),
-            ('Pain Relievers (pack)', 5.00, 1, 5, 3.00, 3, 'Over-the-counter pain relief medication'),
-            ('Bandages (box)', 3.00, 0, 10, 2.00, 5, 'Box of adhesive bandages for minor cuts'),
-            ('Sunscreen (small)', 5.50, 6, 5, 3.50, 3, 'Small bottle of sunscreen for sun protection'),
+    # KPIs
+    total_items = len(df)
+    total_value = df['total'].sum()
+    avg_price = df['unitprice'].mean() if total_items else 0.0
 
-            -- Household
-            ('Batteries (AA, pack of 4)', 4.00, 1, 5, 2.50, 3, 'Pack of 4 AA batteries'),
-            ('Light Bulbs (LED, 2-pack)', 6.00, 3, 3, 4.00, 2, 'Energy-efficient LED light bulbs'),
-            ('Trash Bags (small, 10-pack)', 3.00, 5, 10, 2.00, 5, 'Small trash bags for everyday use'),
-            ('Paper Towels (single roll)', 2.50, 3, 8, 1.50, 5, 'Single roll of paper towels'),
-            ('Multi-Surface Cleaner', 4.50, 2, 5, 3.00, 3, 'All-purpose cleaning spray'),
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Project Items", f"{total_items:,}")
+    c2.metric("Total Project Value", f"${total_value:,.2f}")
+    c3.metric("Avg Unit Price", f"${avg_price:,.2f}")
 
-            -- Others
-            ('Lottery Tickets', 2.00, 17, 20, 1.50, 10, 'Assorted lottery tickets'),
-            ('Newspaper', 1.50, 22, 20, 1.00, 5, 'Daily newspaper')
-        """
-    )
-    conn.commit()
+    # Filters + search
+    st.markdown("### 🔍 Search & Filter Line Items")
+    search_query = st.text_input("Search item or material...", placeholder="e.g. Travertine, Fencing, Pebble")
+    material_options = ["All"] + sorted([m for m in df['material'].unique() if m])
+    selected_material = st.selectbox("Material", material_options)
 
+    # Apply filters
+    filtered = df.copy()
+    if search_query:
+        q = search_query.lower()
+        filtered = filtered[filtered['itemdescription'].str.lower().str.contains(q) | filtered['material'].str.lower().str.contains(q)]
+    if selected_material != "All":
+        filtered = filtered[filtered['material'] == selected_material]
+    if max_price > 0:
+        filtered = filtered[(filtered['unitprice'] >= min_price) & (filtered['unitprice'] <= max_price)]
+    else:
+        filtered = filtered[filtered['unitprice'] >= min_price]
 
-def load_data(conn):
-    """Loads the inventory data from the database."""
-    cursor = conn.cursor()
+    st.dataframe(filtered.sort_values('total', ascending=False), use_container_width=True, hide_index=True)
 
-    try:
-        cursor.execute("SELECT * FROM inventory")
-        data = cursor.fetchall()
-    except:
-        return None
+    # Charts & extras
+    st.markdown("### 🔢 Summary")
+    top_by_value = filtered.groupby('itemdescription')['total'].sum().sort_values(ascending=False).head(10)
+    st.bar_chart(top_by_value)
 
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "id",
-            "item_name",
-            "price",
-            "units_sold",
-            "units_left",
-            "cost_price",
-            "reorder_point",
-            "description",
-        ],
-    )
+    csv = filtered.to_csv(index=False)
+    st.download_button("Download filtered CSV", csv, file_name="lineitems.csv", mime="text/csv")
 
-    return df
-
-
-def update_data(conn, df, changes):
-    """Updates the inventory data in the database."""
-    cursor = conn.cursor()
-
-    if changes["edited_rows"]:
-        deltas = st.session_state.inventory_table["edited_rows"]
-        rows = []
-
-        for i, delta in deltas.items():
-            row_dict = df.iloc[i].to_dict()
-            row_dict.update(delta)
-            rows.append(row_dict)
-
-        cursor.executemany(
-            """
-            UPDATE inventory
-            SET
-                item_name = :item_name,
-                price = :price,
-                units_sold = :units_sold,
-                units_left = :units_left,
-                cost_price = :cost_price,
-                reorder_point = :reorder_point,
-                description = :description
-            WHERE id = :id
-            """,
-            rows,
-        )
-
-    if changes["added_rows"]:
-        cursor.executemany(
-            """
-            INSERT INTO inventory
-                (id, item_name, price, units_sold, units_left, cost_price, reorder_point, description)
-            VALUES
-                (:id, :item_name, :price, :units_sold, :units_left, :cost_price, :reorder_point, :description)
-            """,
-            (defaultdict(lambda: None, row) for row in changes["added_rows"]),
-        )
-
-    if changes["deleted_rows"]:
-        cursor.executemany(
-            "DELETE FROM inventory WHERE id = :id",
-            ({"id": int(df.loc[i, "id"])} for i in changes["deleted_rows"]),
-        )
-
-    conn.commit()
-
-
-# -----------------------------------------------------------------------------
-# Draw the actual page, starting with the inventory table.
-
-# Set the title that appears at the top of the page.
-"""
-# :shopping_bags: Inventory tracker
-
-**Welcome to Alice's Corner Store's intentory tracker!**
-This page reads and writes directly from/to our inventory database.
-"""
-
-st.info(
-    """
-    Use the table below to add, remove, and edit items.
-    And don't forget to commit your changes when you're done.
-    """
-)
-
-# Connect to database and create table if needed
-conn, db_was_just_created = connect_db()
-
-# Initialize data.
-if db_was_just_created:
-    initialize_data(conn)
-    st.toast("Database initialized with some sample data.")
-
-# Load data from database
-df = load_data(conn)
-
-# Display data with editable table
-edited_df = st.data_editor(
-    df,
-    disabled=["id"],  # Don't allow editing the 'id' column.
-    num_rows="dynamic",  # Allow appending/deleting rows.
-    column_config={
-        # Show dollar sign before price columns.
-        "price": st.column_config.NumberColumn(format="$%.2f"),
-        "cost_price": st.column_config.NumberColumn(format="$%.2f"),
-    },
-    key="inventory_table",
-)
-
-has_uncommitted_changes = any(len(v) for v in st.session_state.inventory_table.values())
-
-st.button(
-    "Commit changes",
-    type="primary",
-    disabled=not has_uncommitted_changes,
-    # Update data in database
-    on_click=update_data,
-    args=(conn, df, st.session_state.inventory_table),
-)
-
-
-# -----------------------------------------------------------------------------
-# Now some cool charts
-
-# Add some space
-""
-""
-""
-
-st.subheader("Units left", divider="red")
-
-need_to_reorder = df[df["units_left"] < df["reorder_point"]].loc[:, "item_name"]
-
-if len(need_to_reorder) > 0:
-    items = "\n".join(f"* {name}" for name in need_to_reorder)
-
-    st.error(f"We're running dangerously low on the items below:\n {items}")
-
-""
-""
-
-st.altair_chart(
-    # Layer 1: Bar chart.
-    alt.Chart(df)
-    .mark_bar(
-        orient="horizontal",
-    )
-    .encode(
-        x="units_left",
-        y="item_name",
-    )
-    # Layer 2: Chart showing the reorder point.
-    + alt.Chart(df)
-    .mark_point(
-        shape="diamond",
-        filled=True,
-        size=50,
-        color="salmon",
-        opacity=1,
-    )
-    .encode(
-        x="reorder_point",
-        y="item_name",
-    ),
-    use_container_width=True,
-)
-
-st.caption("NOTE: The :diamonds: location shows the reorder point.")
-
-""
-""
-""
-
-# -----------------------------------------------------------------------------
-
-st.subheader("Best sellers", divider="orange")
-
-""
-""
-
-st.altair_chart(
-    alt.Chart(df)
-    .mark_bar(orient="horizontal")
-    .encode(
-        x="units_sold",
-        y=alt.Y("item_name").sort("-x"),
-    ),
-    use_container_width=True,
-)
+except Exception as e:
+    st.error("Connection Error: unable to fetch line items.")
+    st.exception(e)
